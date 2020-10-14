@@ -8,16 +8,17 @@ use PhpParser\Node\Arg;
 use PhpParser\Node\Expr\StaticCall;
 use PhpParser\Node\Param;
 use PhpParser\Node\Stmt\ClassMethod;
+use PHPStan\Reflection\MethodReflection;
+use PHPStan\Reflection\ParameterReflection;
+use PHPStan\Type\Type;
 use Rector\Core\Exception\ShouldNotHappenException;
 use Rector\Core\PhpParser\Node\Value\ValueResolver;
 use Rector\Core\PhpParser\Printer\BetterStandardPrinter;
-use Rector\Core\ValueObject\MethodName;
 use Rector\NodeCollector\NodeCollector\NodeRepository;
+use Rector\NodeCollector\Reflection\MethodReflectionProvider;
 use Rector\NodeNameResolver\NodeNameResolver;
 use Rector\NodeTypeResolver\Node\AttributeKey;
-use ReflectionClass;
-use ReflectionMethod;
-use ReflectionParameter;
+use Symplify\PackageBuilder\Reflection\PrivatesCaller;
 
 final class CurrentAndParentClassMethodComparator
 {
@@ -41,16 +42,30 @@ final class CurrentAndParentClassMethodComparator
      */
     private $nodeRepository;
 
+    /**
+     * @var MethodReflectionProvider
+     */
+    private $methodReflectionProvider;
+
+    /**
+     * @var PrivatesCaller
+     */
+    private $privatesCaller;
+
     public function __construct(
+        PrivatesCaller $privatesCaller,
         NodeNameResolver $nodeNameResolver,
         ValueResolver $valueResolver,
         BetterStandardPrinter $betterStandardPrinter,
-        NodeRepository $nodeRepository
+        NodeRepository $nodeRepository,
+        MethodReflectionProvider $methodReflectionProvider
     ) {
         $this->nodeNameResolver = $nodeNameResolver;
         $this->valueResolver = $valueResolver;
         $this->betterStandardPrinter = $betterStandardPrinter;
         $this->nodeRepository = $nodeRepository;
+        $this->methodReflectionProvider = $methodReflectionProvider;
+        $this->privatesCaller = $privatesCaller;
     }
 
     public function isParentCallMatching(ClassMethod $classMethod, ?StaticCall $staticCall): bool
@@ -67,7 +82,15 @@ final class CurrentAndParentClassMethodComparator
             return false;
         }
 
-        if (! $this->areArgsAndParamsEqual($staticCall->args, $classMethod->params)) {
+        $parentMethodReflection = $this->methodReflectionProvider->provideByStaticCall($staticCall);
+        if ($parentMethodReflection === null) {
+            return false;
+        }
+
+        $parentParameterTypes = $this->methodReflectionProvider->provideParameterTypesFromMethodReflection(
+            $parentMethodReflection
+        );
+        if (! $this->areArgsAndParamsEqual($staticCall->args, $classMethod->params, $parentParameterTypes)) {
             return false;
         }
 
@@ -75,26 +98,37 @@ final class CurrentAndParentClassMethodComparator
     }
 
     /**
-     * @param Arg[] $args
-     * @param Param[] $params
+     * @param Arg[] $parentStaticCallArgs
+     * @param Param[] $currentClassMethodParams
+     * @param Type[] $parentParameterTypes
      */
-    private function areArgsAndParamsEqual(array $args, array $params): bool
-    {
-        if (count($args) !== count($params)) {
+    private function areArgsAndParamsEqual(
+        array $parentStaticCallArgs,
+        array $currentClassMethodParams,
+        array $parentParameterTypes
+    ): bool {
+        if (count($parentStaticCallArgs) !== count($currentClassMethodParams)) {
             return false;
         }
 
-        foreach ($args as $key => $arg) {
-            if (! isset($params[$key])) {
+        if (count($parentStaticCallArgs) === 0) {
+            return true;
+        }
+
+        foreach ($parentStaticCallArgs as $key => $arg) {
+            if (! isset($currentClassMethodParams[$key])) {
                 return false;
             }
 
-            $param = $params[$key];
-
+            $param = $currentClassMethodParams[$key];
             if (! $this->betterStandardPrinter->areNodesEqual($param->var, $arg->value)) {
                 return false;
             }
         }
+
+        // are param types equal
+//        dump($currentClassMethodParams);
+//        dump($parentParameterTypes);
 
         return true;
     }
@@ -127,16 +161,23 @@ final class CurrentAndParentClassMethodComparator
         string $parentClassName,
         string $methodName
     ): bool {
-        $parentMethodReflection = $this->getReflectionMethod($parentClassName, $methodName);
+        // @todo use phpstan reflecoitn
+        $scope = $classMethod->getAttribute(AttributeKey::SCOPE);
+
+        $parentMethodReflection = $this->methodReflectionProvider->provideByClassAndMethodName(
+            $parentClassName,
+            $methodName,
+            $scope
+        );
 
         // 3rd party code
         if ($parentMethodReflection !== null) {
-            if ($parentMethodReflection->isProtected() && $classMethod->isPublic()) {
+            if (! $parentMethodReflection->isPrivate() && ! $parentMethodReflection->isPublic() && $classMethod->isPublic()) {
                 return true;
             }
 
-            if ($parentMethodReflection->isInternal()) {
-                //we can't know for certain so we assume its an override
+            if ($parentMethodReflection->isInternal()->yes()) {
+                // we can't know for certain so we assume its a override with purpose
                 return true;
             }
 
@@ -148,48 +189,44 @@ final class CurrentAndParentClassMethodComparator
         return false;
     }
 
-    private function getReflectionMethod(string $className, string $methodName): ?ReflectionMethod
-    {
-        if (! method_exists($className, $methodName)) {
-            // internal classes don't have __construct method
-            if ($methodName === MethodName::CONSTRUCT && class_exists($className)) {
-                return (new ReflectionClass($className))->getConstructor();
-            }
-
-            return null;
-        }
-
-        return new ReflectionMethod($className, $methodName);
-    }
-
     private function areParameterDefaultsDifferent(
         ClassMethod $classMethod,
-        ReflectionMethod $reflectionMethod
+        MethodReflection $methodReflection
     ): bool {
-        foreach ($reflectionMethod->getParameters() as $key => $reflectionParameter) {
+        $parameterReflections = $this->methodReflectionProvider->getMethodReflectionParameterReflections(
+            $methodReflection
+        );
+
+        foreach ($parameterReflections as $key => $parameterReflection) {
             if (! isset($classMethod->params[$key])) {
-                if ($reflectionParameter->isDefaultValueAvailable()) {
+                if ($parameterReflection->getDefaultValue()) {
                     continue;
                 }
+
                 return true;
             }
 
             $methodParam = $classMethod->params[$key];
 
-            if ($this->areDefaultValuesDifferent($reflectionParameter, $methodParam)) {
+            if ($this->areDefaultValuesDifferent($parameterReflection, $methodParam)) {
                 return true;
             }
         }
+
         return false;
     }
 
-    private function areDefaultValuesDifferent(ReflectionParameter $reflectionParameter, Param $methodParam): bool
+    private function areDefaultValuesDifferent(ParameterReflection $parameterReflection, Param $methodParam): bool
     {
-        if ($reflectionParameter->isDefaultValueAvailable() !== isset($methodParam->default)) {
+        if ($parameterReflection->getDefaultValue() === $methodParam->default) {
+            return false;
+        }
+
+        if ($parameterReflection->getDefaultValue() !== isset($methodParam->default)) {
             return true;
         }
 
-        return $reflectionParameter->isDefaultValueAvailable() && $methodParam->default !== null &&
-            ! $this->valueResolver->isValue($methodParam->default, $reflectionParameter->getDefaultValue());
+        return $parameterReflection->getDefaultValue() && $methodParam->default !== null &&
+            ! $this->valueResolver->isValue($methodParam->default, $parameterReflection->getDefaultValue());
     }
 }
